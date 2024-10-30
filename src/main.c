@@ -49,8 +49,9 @@ int btn_prev = 0;
 #define GAMEPAD_ADDR 0x52
 #define GAMEPAD_BUF_LENGTH 21
 
-#define POWERDOWN_TIMEOUT 5
+#define POWERDOWN_TIMEOUT 5 // minutes
 
+bool espnow_initialized = false;
 bool gamepad_connected = false;
 // default buf for prev button comparison, reset after deep sleep, so we use clear buttons template
 static uint8_t gamepad_buf[GAMEPAD_BUF_LENGTH] = { 0x00 };
@@ -116,46 +117,17 @@ static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status
     }
 }
 
-// static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
-// {
-//     espnow_event_t evt;
-//     memset(&evt, 0, sizeof(espnow_event_t));
-//     uint8_t * mac_addr = recv_info->src_addr;
-//     uint8_t * des_addr = recv_info->des_addr;
-
-//     if (mac_addr == NULL || data == NULL || len <= 0) {
-//         ESP_LOGE(TAG, "Receive cb arg error");
-//         return;
-//     }
-//     if (len > sizeof(gamepad_buf)+1) {
-//         ESP_LOGE(TAG, "Receive cb, data too long");
-//         return;
-//     }
-
-//     if (IS_BROADCAST_ADDR(des_addr)) {
-//         /* If added a peer with encryption before, the receive packets may be
-//          * encrypted as peer-to-peer message or unencrypted over the broadcast channel.
-//          * Users can check the destination address to distinguish it.
-//          */
-//         ESP_LOGD(TAG, "Receive broadcast ESPNOW data");
-//     } else {
-//         ESP_LOGD(TAG, "Receive unicast ESPNOW data");
-//     }
-
-//     evt.is_send_cb = false;
-//     memcpy(evt.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-//     evt.data = malloc(len);
-//     if (evt.data == NULL) {
-//         ESP_LOGE(TAG, "Malloc receive data fail");
-//         return;
-//     }
-//     memcpy(evt.data, data, len);
-//     evt.data_len = len;
-//     if (xQueueSend(s_data_queue, &evt, 0) != pdTRUE) {
-//         ESP_LOGW(TAG, "Send receive queue fail");
-//         free(evt.data);
-//     }
-// }
+static void espnow_deinit(void)
+{
+    if (!espnow_initialized) {
+        return;
+    }
+    if (s_data_queue != NULL) {
+        vQueueDelete(s_data_queue);
+    }
+    esp_now_deinit();
+    espnow_initialized = false;
+}
 
 static esp_err_t espnow_init(void)
 {
@@ -178,8 +150,7 @@ static esp_err_t espnow_init(void)
     esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
     if (peer == NULL) {
         ESP_LOGE(TAG, "Malloc peer information fail");
-        vSemaphoreDelete(s_data_queue);
-        esp_now_deinit();
+        espnow_deinit();
         return ESP_FAIL;
     }
     memset(peer, 0, sizeof(esp_now_peer_info_t));
@@ -192,13 +163,19 @@ static esp_err_t espnow_init(void)
     ESP_ERROR_CHECK( esp_now_add_peer(peer) );
     free(peer);
 
+    espnow_initialized = true;
     return ESP_OK;
 }
 
-static void espnow_deinit(void)
+void espnow_init_hw(void)
 {
-    vSemaphoreDelete(s_data_queue);
-    esp_now_deinit();
+    if (espnow_initialized) {
+        esp_wifi_start();
+        return;
+    }
+    nvs_init();
+    wifi_init();
+    ESP_ERROR_CHECK( espnow_init() );
 }
 
 static void gamepads_update(void)
@@ -213,16 +190,28 @@ static void gamepads_update(void)
     struct timeval tv;
     
     if (!gamepad_connected) {
+        int retries = 10;
+        while (retries > 0) {
+            err = i2c_master_write_to_device(
+                I2C_PORT, GAMEPAD_ADDR,
+                init_buf1, sizeof(init_buf1),
+                8 / portTICK_PERIOD_MS
+            );
+            ESP_LOGI(TAG, "I2C init ret 1: %d", err);
+            if (err != ESP_OK) {
+                vTaskDelay(20 / portTICK_PERIOD_MS);
+                retries--;
+            } else {
+                break;
+            }
+        }
+
         err = i2c_master_write_to_device(
             I2C_PORT, GAMEPAD_ADDR,
             init_buf1, sizeof(init_buf1),
             8 / portTICK_PERIOD_MS
         );
         ESP_LOGI(TAG, "I2C init ret 1: %d", err);
-        // if (err == ESP_FAIL) {
-        //     esp_wifi_start();
-        //     esp_now_send(s_mac_receiver, gamepad_home_btn_send_buf, sizeof(gamepad_home_btn_send_buf));
-        // }
 
         if (err == ESP_OK) {
             err = i2c_master_write_to_device(
@@ -298,20 +287,12 @@ static void gamepads_update(void)
             // print buttons buf
             if (memcmp(btn_buf, gamepad_buf, sizeof(btn_buf)) != 0) {
                 // send new data
-                esp_wifi_start();
+                espnow_init_hw();
                 memcpy(gamepad_buf, btn_buf, sizeof(gamepad_buf));
-                ESP_LOGI(TAG, "Left buttons: %02x %02x %02x %02x %02x %02x %02x %02x",
+                ESP_LOGI(TAG, "Gamepad buttons: %02x %02x %02x %02x %02x %02x %02x %02x",
                     gamepad_buf[0], gamepad_buf[1], gamepad_buf[2], gamepad_buf[3],
                     gamepad_buf[4], gamepad_buf[5], gamepad_buf[6], gamepad_buf[7]
                 );
-                // printf("Left buttons: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                //     gamepad_left_buf[8], gamepad_left_buf[9], gamepad_left_buf[10], gamepad_left_buf[11],
-                //     gamepad_left_buf[12], gamepad_left_buf[13], gamepad_left_buf[14], gamepad_left_buf[15]
-                // );
-                // printf("Left buttons: %02x %02x %02x %02x %02x\n",
-                //     gamepad_left_buf[16], gamepad_left_buf[17], gamepad_left_buf[18], gamepad_left_buf[19],
-                //     gamepad_left_buf[20]
-                // );
                 send_buf[0] = 0x00; // left gamepad // TODO: add left/right hardware config
                 memcpy(send_buf+1, gamepad_buf, sizeof(gamepad_buf));
                 esp_now_send(s_mac_receiver, send_buf, sizeof(send_buf));
@@ -331,12 +312,12 @@ static void gpio_init(void)
 {
     // led
     gpio_config_t io_conf = {};
-    io_conf.intr_type = GPIO_INTR_DISABLE;
-    io_conf.mode = GPIO_MODE_OUTPUT;
-    io_conf.pin_bit_mask = 1ULL << GPIO_LED;
-    io_conf.pull_down_en = 0;
-    io_conf.pull_up_en = 0;
-    gpio_config(&io_conf);
+    // io_conf.intr_type = GPIO_INTR_DISABLE;
+    // io_conf.mode = GPIO_MODE_OUTPUT;
+    // io_conf.pin_bit_mask = 1ULL << GPIO_LED;
+    // io_conf.pull_down_en = 0;
+    // io_conf.pull_up_en = 0;
+    // gpio_config(&io_conf);
 
     // // button
     // io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -389,6 +370,7 @@ static void sleep(void)
     gettimeofday(&tv, NULL);
     if (tv.tv_sec - gamepad_last_update > POWERDOWN_TIMEOUT * 60) {
         ESP_LOGI(TAG, "Going to sleep at %lld", tv.tv_sec);
+        memcpy(gamepad_sleep_buf, gamepad_buf, sizeof(gamepad_sleep_buf));
         gpio_hold_dis(GPIO_GAMEPAD_PWR);
         gpio_set_level(GPIO_GAMEPAD_PWR, 0); // disable gamepad power
         ESP_ERROR_CHECK( esp_sleep_enable_timer_wakeup(30 * 1000 * 1000) );
@@ -396,36 +378,19 @@ static void sleep(void)
         espnow_deinit();
         esp_wifi_stop();
         nvs_flash_deinit();
-        memcpy(gamepad_sleep_buf, gamepad_buf, sizeof(gamepad_sleep_buf));
         esp_deep_sleep_start();
         // sleeping for 30 seconds until RESET !!
-        // gettimeofday(&tv, NULL);
-        // ESP_LOGI(TAG, "Woke up at %lld", tv.tv_sec);
-        // nvs_init();
-        // wifi_init();
-        // espnow_init();
-    } else {
-        // light sleep for 10ms
-        // esp_sleep_config_gpio_isolate();
-        // ESP_ERROR_CHECK( esp_sleep_enable_timer_wakeup(10 * 1000 * 1000) );
-        // ESP_ERROR_CHECK( esp_light_sleep_start() );
-        // espnow_deinit();
-        // esp_wifi_stop();
-        // vTaskDelay(40 / portTICK_PERIOD_MS);
-        // esp_wifi_start();
-        // espnow_init();
     }
 }
 
 static void main_task(void *)
 {
-    vTaskDelay(1500 / portTICK_PERIOD_MS);
+    // vTaskDelay(10000 / portTICK_PERIOD_MS);
     ESP_LOGI(TAG, "Task started");
 
     memcpy(gamepad_buf, gamepad_sleep_buf, sizeof(gamepad_sleep_buf));
     i2c_init_gamepads();
     
-    esp_wifi_stop();
     while (true) {
         gamepads_update(); // will enable wifi if buttons change
         sleep();
@@ -437,14 +402,22 @@ static void espnow_send_cb_task(void *)
     espnow_event_t evt;
 
     while (true) {
-        if (xQueueReceive(s_data_queue, &evt, 100 / portTICK_PERIOD_MS) == pdTRUE) {
-            if (evt.is_send_cb) {
-                ESP_LOGI(TAG, "Sent data to "MACSTR", status: %d, data_len: %d", MAC2STR(evt.mac_addr), evt.status, evt.data_len);
+        if (espnow_initialized) {
+            if (xQueueReceive(s_data_queue, &evt, 100 / portTICK_PERIOD_MS) == pdTRUE) {
+                if (!espnow_initialized) {
+                    ESP_LOGW(TAG, "ESPNOW not initialized");
+                    continue;
+                }
+                if (evt.is_send_cb) {
+                    ESP_LOGI(TAG, "Sent data to "MACSTR", status: %d, data_len: %d", MAC2STR(evt.mac_addr), evt.status, evt.data_len);
+                }
+                if (evt.data_len > 0) {
+                    free(evt.data);
+                }
+                esp_wifi_stop(); // stop wifi until next button change
             }
-            if (evt.data_len > 0) {
-                free(evt.data);
-            }
-            esp_wifi_stop(); // stop wifi until next button change
+        } else {
+            vTaskDelay(100 / portTICK_PERIOD_MS);
         }
     }
 }
@@ -466,18 +439,14 @@ void app_main(void)
     esp_deep_sleep_disable_rom_logging();
     gpio_init();
 
-    nvs_init();
-    wifi_init();
-    ESP_ERROR_CHECK( espnow_init() );
-
     xTaskCreate(main_task, "main_task", 10240, NULL, 4, NULL);
     xTaskCreate(espnow_send_cb_task, "send_cb_task", 4096, NULL, 4, NULL);
 
     // blink start led
-    while (true) {
-        gpio_set_level(GPIO_LED, 1);
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-        gpio_set_level(GPIO_LED, 0);
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
+    // while (true) {
+    //     gpio_set_level(GPIO_LED, 1);
+    //     vTaskDelay(5000 / portTICK_PERIOD_MS);
+    //     gpio_set_level(GPIO_LED, 0);
+    //     vTaskDelay(10 / portTICK_PERIOD_MS);
+    // }
 }
