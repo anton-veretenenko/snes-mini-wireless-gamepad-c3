@@ -21,6 +21,7 @@
 #include "esp_sleep.h"
 #include "sys/time.h"
 #include "esp_pm.h"
+#include "driver/rtc_io.h"
 
 static void main_task(void *);
 static void gamepads_update(void);
@@ -40,6 +41,7 @@ int btn_prev = 0;
 
 #define GPIO_LED GPIO_NUM_8
 #define GPIO_GAMEPAD_PWR GPIO_NUM_1
+#define GPIO_WAKEUP_BTN GPIO_NUM_2
 
 #define I2C_SCL 4
 #define I2C_SDA 3
@@ -49,7 +51,7 @@ int btn_prev = 0;
 #define GAMEPAD_ADDR 0x52
 #define GAMEPAD_BUF_LENGTH 21
 
-#define POWERDOWN_TIMEOUT 5 // minutes
+#define POWERDOWN_TIMEOUT 1 // minutes
 
 bool espnow_initialized = false;
 bool gamepad_connected = false;
@@ -312,12 +314,12 @@ static void gpio_init(void)
 {
     // led
     gpio_config_t io_conf = {};
-    // io_conf.intr_type = GPIO_INTR_DISABLE;
-    // io_conf.mode = GPIO_MODE_OUTPUT;
-    // io_conf.pin_bit_mask = 1ULL << GPIO_LED;
-    // io_conf.pull_down_en = 0;
-    // io_conf.pull_up_en = 0;
-    // gpio_config(&io_conf);
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = 1ULL << GPIO_LED;
+    io_conf.pull_down_en = 0;
+    io_conf.pull_up_en = 0;
+    gpio_config(&io_conf);
 
     // // button
     // io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -335,6 +337,14 @@ static void gpio_init(void)
     gpio_config(&io_conf);
     gpio_set_level(GPIO_GAMEPAD_PWR, 1); // enable gamepad power
     gpio_hold_en(GPIO_GAMEPAD_PWR); // hold pin value during light sleep
+
+    // wakeup pin config
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.pin_bit_mask = 1ULL << GPIO_WAKEUP_BTN;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = 1;
+    io_conf.pull_down_en = 0;
+    gpio_config(&io_conf);
 }
 
 static void i2c_init_gamepads(void)
@@ -373,13 +383,20 @@ static void sleep(void)
         memcpy(gamepad_sleep_buf, gamepad_buf, sizeof(gamepad_sleep_buf));
         gpio_hold_dis(GPIO_GAMEPAD_PWR);
         gpio_set_level(GPIO_GAMEPAD_PWR, 0); // disable gamepad power
-        ESP_ERROR_CHECK( esp_sleep_enable_timer_wakeup(30 * 1000 * 1000) );
-        esp_sleep_config_gpio_isolate();
+        // esp_sleep_config_gpio_isolate();
+        // Isolate specific GPIOs, but NOT the wakeup pin
+        gpio_config_t isolate_conf = {};
+        isolate_conf.mode = GPIO_MODE_DISABLE;
+        isolate_conf.pin_bit_mask = (1ULL << GPIO_LED) | (1ULL << I2C_SDA) | (1ULL << I2C_SCL)| (1ULL << GPIO_GAMEPAD_PWR);
+        gpio_config(&isolate_conf);
+        // enable wakeup on button
+        esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+        esp_deep_sleep_enable_gpio_wakeup(1ULL << GPIO_WAKEUP_BTN, ESP_GPIO_WAKEUP_GPIO_LOW); // wakeup on button press (low level)
+        // esp_deep_sleep_enable_gpio_wakeup(1ULL << GPIO_NUM_2, ESP_GPIO_WAKEUP_GPIO_LOW);
         espnow_deinit();
         esp_wifi_stop();
         nvs_flash_deinit();
         esp_deep_sleep_start();
-        // sleeping for 30 seconds until RESET !!
     }
 }
 
@@ -424,6 +441,7 @@ static void espnow_send_cb_task(void *)
 
 void power_init(void)
 {
+    // comment to enable usb console, otherwise would not work!
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 160,
         .min_freq_mhz = 10,
@@ -439,14 +457,18 @@ void app_main(void)
     esp_deep_sleep_disable_rom_logging();
     gpio_init();
 
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    gamepad_last_update = tv.tv_sec;
+
     xTaskCreate(main_task, "main_task", 10240, NULL, 4, NULL);
     xTaskCreate(espnow_send_cb_task, "send_cb_task", 4096, NULL, 4, NULL);
 
     // blink start led
-    // while (true) {
-    //     gpio_set_level(GPIO_LED, 1);
-    //     vTaskDelay(5000 / portTICK_PERIOD_MS);
-    //     gpio_set_level(GPIO_LED, 0);
-    //     vTaskDelay(10 / portTICK_PERIOD_MS);
-    // }
+    while (true) {
+        gpio_set_level(GPIO_LED, 1);
+        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        gpio_set_level(GPIO_LED, 0);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
 }
